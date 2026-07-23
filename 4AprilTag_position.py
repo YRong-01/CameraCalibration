@@ -7,13 +7,13 @@ import numpy as np
 # ============================================================
 
 K = np.array([
-    [1.51339478e+03, 0.00000000e+00, 9.92839853e+02],
-    [0.00000000e+00, 1.50238718e+03, 4.88597228e+02],
-    [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]
+    [1421.35831, 0.0,        968.022155],
+    [0.0,        1407.63866, 548.181164],
+    [0.0,        0.0,        1.0]
 ], dtype=np.float32)
 
 dist = np.array([
-    [-5.51964568e-03, 6.93801723e-01, 3.26991913e-04, 4.77776670e-03, -6.15503232e+00]
+    [0.0403473, -0.12000733, -0.00167514, 0.00079997, 0.09664386]
 ], dtype=np.float32)
 
 
@@ -23,10 +23,10 @@ dist = np.array([
 # ============================================================
 
 T_base_cam = np.array([
-    [-0.74779584, 0.48554782, -0.45281861, 0.66213106],
-    [0.65192636, 0.66609337, -0.36236947, 0.36685141],
-    [0.12567177, -0.56618278, -0.81464328, 0.62996175],
-    [0.0, 0.0, 0.0, 1.0]
+    [ 0.85725896, -0.3865265,   0.34067652,  0.21830717],
+    [-0.51494545, -0.66883921,  0.53629638, -0.46229873],
+    [-0.0014499,  -0.6351747,  -0.77240847,  0.59859083],
+    [ 0.0,         0.0,         0.0,         1.0]
 ], dtype=np.float32)
 
 T_cam_base = np.linalg.inv(T_base_cam)
@@ -156,16 +156,12 @@ aruco_dict = cv2.aruco.getPredefinedDictionary(
     cv2.aruco.DICT_APRILTAG_36h11
 )
 
-# Create detector with compatibility for different OpenCV versions
-try:
-    aruco_params = cv2.aruco.DetectorParameters()
-except AttributeError:
-    aruco_params = cv2.aruco.DetectorParameters_create()
+aruco_params = cv2.aruco.DetectorParameters()
 
-if hasattr(cv2.aruco, 'ArucoDetector'):
-    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
-else:
-    detector = None
+detector = cv2.aruco.ArucoDetector(
+    aruco_dict,
+    aruco_params
+)
 
 
 # ============================================================
@@ -194,25 +190,11 @@ def main():
     # 1 or 2 = possible external/robot camera
     # ============================================================
 
-    camera_index = 0
+    camera_index = 1
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
 
-    use_image_fallback = False
-
     if not cap.isOpened():
-        # try default camera
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
-    if not cap.isOpened():
-        print(f"Could not open camera index {camera_index} or 0. Falling back to static image if available.")
-        use_image_fallback = True
-
-    # Match the camera frame size to the calibrated image resolution implied by the camera matrix.
-    target_width = int(round(K[0, 2] * 2.0))
-    target_height = int(round(K[1, 2] * 2.0))
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+        raise RuntimeError(f"Could not open camera index {camera_index}.")
 
     # ============================================================
     # 6. Main loop
@@ -224,41 +206,22 @@ def main():
     angle_alpha = 0.3  # smoothing for displayed Euler angles
 
     while True:
-        if use_image_fallback:
-            # look for a sample image in images/
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            images_dir = os.path.join(script_dir, "images")
-            jpgs = [os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.lower().endswith('.jpg')]
-            if not jpgs:
-                print("No images found for fallback processing.")
-                break
-            frame = cv2.imread(jpgs[0])
-            ret = frame is not None
-            # process single image then exit loop
-            single_image_mode = True
-        else:
-            ret, frame = cap.read()
+        ret, frame = cap.read()
 
-            if not ret:
-                print("Failed to read frame from camera.")
-                break
-
-        if frame.shape[1] != target_width or frame.shape[0] != target_height:
-            frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+        if not ret:
+            print("Failed to read frame.")
+            break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Detect AprilTag markers (support both detector APIs)
-        if detector is not None:
-            corners, ids, rejected = detector.detectMarkers(gray)
-        else:
-            corners, ids, rejected = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=aruco_params)
+        # Detect AprilTag markers
+        corners, ids, rejected = detector.detectMarkers(gray)
 
         if ids is not None:
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
             for i in range(len(ids)):
-                tag_id = int(np.atleast_1d(ids[i]).flat[0])
+                tag_id = int(ids[i][0])
 
                 # 2D pixel coordinates of this marker's corners
                 marker_2d_points = corners[i][0].astype(np.float32)
@@ -408,19 +371,12 @@ def main():
                     2
                 )
 
-        # show result (will open window in interactive use)
-        try:
-            cv2.imshow("AprilTag Detection", frame)
-            key = cv2.waitKey(1)
-            if key == ord("q"):
-                break
-        except Exception:
-            # In headless environments, save an output image and exit
-            out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'images', 'apriltag_output.jpg')
-            cv2.imwrite(out_path, frame)
-            print(f"Saved output to {out_path}")
-            if use_image_fallback:
-                break
+        cv2.imshow("AprilTag Detection", frame)
+
+        key = cv2.waitKey(1)
+
+        if key == ord("q"):
+            break
 
     # ============================================================
     # 7. Clean up
