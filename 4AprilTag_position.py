@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 
 
 # ============================================================
@@ -7,13 +8,16 @@ import numpy as np
 # ============================================================
 
 K = np.array([
-    [1421.35831, 0.0,        968.022155],
-    [0.0,        1407.63866, 548.181164],
-    [0.0,        0.0,        1.0]
+    [1.43553840e+03, 0, 9.52110915e+02],
+        [0, 1.44008973e+03, 5.19050486e+02],
+        [0, 0, 1]
 ], dtype=np.float32)
 
+CALIBRATED_FRAME_WIDTH = 1920
+CALIBRATED_FRAME_HEIGHT = 1080
+
 dist = np.array([
-    [0.0403473, -0.12000733, -0.00167514, 0.00079997, 0.09664386]
+    [0.09119437, -0.50490922, -0.00144585, 0.00378291, 1.05208589]
 ], dtype=np.float32)
 
 
@@ -23,10 +27,10 @@ dist = np.array([
 # ============================================================
 
 T_base_cam = np.array([
-    [ 0.85725896, -0.3865265,   0.34067652,  0.21830717],
-    [-0.51494545, -0.66883921,  0.53629638, -0.46229873],
-    [-0.0014499,  -0.6351747,  -0.77240847,  0.59859083],
-    [ 0.0,         0.0,         0.0,         1.0]
+    [ 0.9975587,   0.06142269, -0.03322511,  0.48778147],
+    [ 0.06862797, -0.77426959,  0.62912383, -0.4575121 ],
+    [ 0.01291729, -0.62986813, -0.77659467,  0.61518938],
+    [ 0.         ,  0.         ,  0.         ,  1.        ]
 ], dtype=np.float32)
 
 T_cam_base = np.linalg.inv(T_base_cam)
@@ -129,46 +133,87 @@ def quaternion_slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
     return q
 
 
-def average_quaternions(quaternions: list[np.ndarray]) -> np.ndarray:
-    """Average a list of quaternions with sign consistency."""
-    if not quaternions:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-
-    q_avg = quaternions[0].astype(np.float32).copy()
-
-    for q in quaternions[1:]:
-        if np.dot(q_avg, q) < 0.0:
-            q = -q
-        q_avg += q.astype(np.float32)
-
-    q_avg /= len(quaternions)
-    q_avg /= np.linalg.norm(q_avg)
-    return q_avg
-
-
 # ============================================================
 # 3. AprilTag marker settings
 # ============================================================
 
-MARKER_SIZE = 0.0457 # meters
+MARKER_SIZE = 0.0457 # measure the sidelength in meters
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(
     cv2.aruco.DICT_APRILTAG_36h11
 )
 
-aruco_params = cv2.aruco.DetectorParameters()
+detector = None
+if hasattr(cv2.aruco, "ArucoDetector"):
+    # OpenCV 4.7+ API
+    aruco_params = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(
+        aruco_dict,
+        aruco_params
+    )
+else:
+    # OpenCV 4.6 and earlier API
+    aruco_params = cv2.aruco.DetectorParameters_create()
 
-detector = cv2.aruco.ArucoDetector(
-    aruco_dict,
-    aruco_params
-)
+
+def detect_apriltag_markers(gray: np.ndarray):
+    """Detect AprilTags with both old and new OpenCV ArUco APIs."""
+    gray = np.ascontiguousarray(gray)
+
+    if detector is not None:
+        return detector.detectMarkers(gray)
+
+    return cv2.aruco.detectMarkers(
+        gray,
+        aruco_dict,
+        parameters=aruco_params
+    )
+
+
+def open_camera(camera_index: int) -> cv2.VideoCapture:
+    """Open the camera and request the resolution used for calibration."""
+    cap = cv2.VideoCapture(camera_index)
+
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open camera index {camera_index}. "
+            "Check that no other program is currently using the camera."
+        )
+
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CALIBRATED_FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CALIBRATED_FRAME_HEIGHT)
+    return cap
+
+
+def camera_matrix_for_frame(frame: np.ndarray) -> np.ndarray:
+    """Scale the calibrated intrinsics to the actual captured frame size."""
+    frame_height, frame_width = frame.shape[:2]
+
+    if (
+        frame_width == CALIBRATED_FRAME_WIDTH
+        and frame_height == CALIBRATED_FRAME_HEIGHT
+    ):
+        return K
+
+    scale_x = frame_width / CALIBRATED_FRAME_WIDTH
+    scale_y = frame_height / CALIBRATED_FRAME_HEIGHT
+
+    K_frame = K.copy()
+    K_frame[0, 0] *= scale_x
+    K_frame[0, 2] *= scale_x
+    K_frame[1, 1] *= scale_y
+    K_frame[1, 2] *= scale_y
+    return K_frame
 
 
 # ============================================================
 # 4. 3D marker corner coordinates in marker frame
 #
-# Marker center is the origin: (0, 0, 0)
-# z = 0 because the marker is flat on the table
+# The marker center is the origin (0, 0, 0), and the marker's local
+# x-y plane lies on its printed surface. Therefore every corner has local
+# z = 0 because an AprilTag is planar. The tag may have any position and
+# orientation in the camera/robot frame; solvePnP estimates that 3D pose.
 # ============================================================
 
 half_size = MARKER_SIZE / 2.0
@@ -181,20 +226,98 @@ marker_3d_points = np.array([
 ], dtype=np.float32)
 
 
+def estimate_marker_pose(marker_2d_points: np.ndarray, K_frame: np.ndarray):
+    """Estimate an AprilTag pose in the robot base frame."""
+    success, rvec, tvec = cv2.solvePnP(
+        marker_3d_points,
+        marker_2d_points,
+        K_frame,
+        dist,
+        flags=cv2.SOLVEPNP_IPPE
+    )
+    if not success:
+        return None
+
+    p_cam = np.append(tvec.reshape(3), 1.0).astype(np.float32)
+    p_base = T_base_cam @ p_cam
+    R_cam_marker, _ = cv2.Rodrigues(rvec)
+    R_base_marker = T_base_cam[:3, :3] @ R_cam_marker
+    q_base_marker = rotation_matrix_to_quaternion(R_base_marker).astype(np.float32)
+
+    return {
+        "pos": p_base[:3].astype(np.float32),
+        "euler_deg": np.degrees(
+            rotation_matrix_to_euler_xyz(R_base_marker)
+        ).astype(np.float32),
+        "q": q_base_marker,
+        "rvec": rvec,
+        "tvec": tvec,
+    }
+
+
+def find_tag_poses(
+    tag_ids,
+    camera_index: int = 4,
+    num_samples: int = 10,
+    timeout_seconds: float = 60.0,
+):
+    """Capture the first available base-frame pose for each AprilTag ID.
+
+    ``num_samples`` is retained for compatibility with existing callers but is
+    intentionally ignored; poses are no longer averaged across frames.
+    """
+    requested_ids = {int(tag_id) for tag_id in tag_ids}
+    results = {}
+    cap = open_camera(camera_index)
+    start_time = time.monotonic()
+
+    try:
+        while time.monotonic() - start_time < timeout_seconds:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            K_frame = camera_matrix_for_frame(frame)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = detect_apriltag_markers(gray)
+            if ids is None:
+                continue
+
+            flat_ids = np.asarray(ids).reshape(-1)
+            for index, detected_id in enumerate(flat_ids):
+                tag_id = int(detected_id)
+                if tag_id not in requested_ids or tag_id in results:
+                    continue
+
+                marker_2d_points = corners[index][0].astype(np.float32)
+                pose = estimate_marker_pose(marker_2d_points, K_frame)
+                if pose is None:
+                    continue
+
+                results[tag_id] = {
+                    "pos": pose["pos"],
+                    "euler_deg": pose["euler_deg"],
+                }
+                print(f"Captured AprilTag {tag_id} pose")
+
+            if requested_ids.issubset(results):
+                break
+    finally:
+        cap.release()
+
+    return results
+
+
 def main():
     # ============================================================
     # 5. Open camera
     #
     # Change the camera index if needed:
-    # 0 = default laptop camera
-    # 1 or 2 = possible external/robot camera
+    # Use camera_device_test.py to find the index of the camera connected
     # ============================================================
 
-    camera_index = 1
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {camera_index}.")
+    camera_index = 4
+    cap = open_camera(camera_index)
 
     # ============================================================
     # 6. Main loop
@@ -204,6 +327,7 @@ def main():
     orientation_state = {}
     slerp_alpha = 0.3  # how much of the new orientation to blend in (0..1)
     angle_alpha = 0.3  # smoothing for displayed Euler angles
+    printed_frame_info = False
 
     while True:
         ret, frame = cap.read()
@@ -212,10 +336,26 @@ def main():
             print("Failed to read frame.")
             break
 
+        K_frame = camera_matrix_for_frame(frame)
+
+        if not printed_frame_info:
+            frame_height, frame_width = frame.shape[:2]
+            print(f"Actual camera frame size: {frame_width}x{frame_height}")
+            if (
+                frame_width != CALIBRATED_FRAME_WIDTH
+                or frame_height != CALIBRATED_FRAME_HEIGHT
+            ):
+                print(
+                    "Scaling camera intrinsics from "
+                    f"{CALIBRATED_FRAME_WIDTH}x{CALIBRATED_FRAME_HEIGHT} "
+                    f"to {frame_width}x{frame_height}."
+                )
+            printed_frame_info = True
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Detect AprilTag markers
-        corners, ids, rejected = detector.detectMarkers(gray)
+        corners, ids, rejected = detect_apriltag_markers(gray)
 
         if ids is not None:
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
@@ -230,7 +370,7 @@ def main():
                 success, rvec, tvec = cv2.solvePnP(
                     marker_3d_points,
                     marker_2d_points,
-                    K,
+                    K_frame,
                     dist,
                     flags=cv2.SOLVEPNP_IPPE
                 )
@@ -241,7 +381,7 @@ def main():
                 # Draw coordinate axes on marker
                 cv2.drawFrameAxes(
                     frame,
-                    K,
+                    K_frame,
                     dist,
                     rvec,
                     tvec,
@@ -267,27 +407,10 @@ def main():
 
                 q_current = rotation_matrix_to_quaternion(R_base_marker).astype(np.float32)
 
-                pos_current = p_base[:3].astype(np.float32)
-
-                state = orientation_state.setdefault(tag_id, {"q_smoothed": None, "euler_deg": None, "pos_buffer": [], "q_buffer": [], "averaged_printed": False})
-
-                # Update rolling buffers for averaging (10 samples)
-                pos_buf = state["pos_buffer"]
-                q_buf = state["q_buffer"]
-
-                # keep quaternion sign consistent with last stored to avoid flips
-                if len(q_buf) > 0 and np.dot(q_buf[-1], q_current) < 0.0:
-                    q_to_store = -q_current
-                else:
-                    q_to_store = q_current
-
-                pos_buf.append(pos_current)
-                q_buf.append(q_to_store)
-                if len(pos_buf) > 10:
-                    pos_buf.pop(0)
-                    q_buf.pop(0)
-
-                averaged_ready = len(pos_buf) == 10
+                state = orientation_state.setdefault(
+                    tag_id,
+                    {"q_smoothed": None, "euler_deg": None}
+                )
 
                 # Maintain SLERP-based smoothed quaternion for live display
                 if state["q_smoothed"] is None:
@@ -316,26 +439,8 @@ def main():
 
                 state["euler_deg"] = euler_deg
 
-                # When buffer is full, compute averaged result. Print it only once per tag.
-                if averaged_ready:
-                    pos_mean = np.mean(pos_buf, axis=0)
-                    q_avg = average_quaternions(q_buf)
-                    R_avg = quaternion_to_rotation_matrix(q_avg)
-                    euler_avg = np.degrees(rotation_matrix_to_euler_xyz(R_avg))
-
-                    if not state.get("averaged_printed", False):
-                        print(f"Tag ID: {tag_id} (averaged over 10 frames)")
-                        print(f"Averaged position in robot base frame: {pos_mean}")
-                        print(f"Averaged orientation (roll, pitch, yaw deg): {euler_avg}")
-                        print("--------------------------------")
-                        state["averaged_printed"] = True
-
-                    disp_pos = pos_mean
-                    disp_euler = euler_avg
-                else:
-                    # Not enough samples yet; do not spam the console. Show live values on overlay only.
-                    disp_pos = p_base[:3]
-                    disp_euler = euler_deg
+                disp_pos = p_base[:3]
+                disp_euler = euler_deg
 
                 # Display result on image
                 center_pixel = marker_2d_points.mean(axis=0).astype(int)

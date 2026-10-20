@@ -1,5 +1,3 @@
-import os
-
 import cv2
 import numpy as np
 
@@ -8,13 +6,13 @@ SQUARE_SIZE = 0.025
 
 # Your intrinsic result
 camera_matrix = np.array([
-    [1.51339478e+03, 0.00000000e+00, 9.92839853e+02],
-    [0.00000000e+00, 1.50238718e+03, 4.88597228e+02],
-    [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]
+    [1.43553840e+03, 0, 9.52110915e+02],
+    [0, 1.44008973e+03, 5.19050486e+02],
+    [0, 0, 1]
 ], dtype=np.float32)
 
 dist_coeffs = np.array([
-    -5.51964568e-03, 6.93801723e-01, 3.26991913e-04, 4.77776670e-03, -6.15503232e+00
+    [0.09119437, -0.50490922, -0.00144585, 0.00378291, 1.05208589]
 ], dtype=np.float32)
 
 # Create 3D checkerboard points
@@ -27,22 +25,7 @@ objp[:, :2] = np.mgrid[
 objp = objp * SQUARE_SIZE
 
 # Load image
-script_dir = os.path.dirname(os.path.abspath(__file__))
-images_dir = os.path.join(script_dir, "images")
-# pick a checkerboard image; prefer test.jpg if present
-preferred = os.path.join(images_dir, "test.jpg")
-if os.path.exists(preferred):
-    image_path = preferred
-else:
-    jpgs = [os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.lower().endswith('.jpg')]
-    if not jpgs:
-        raise FileNotFoundError(f"Could not find any .jpg images in: {images_dir}")
-    image_path = jpgs[0]
-
-img = cv2.imread(image_path)
-if img is None:
-    raise FileNotFoundError(f"Could not read checkerboard image: {image_path}")
-
+img = cv2.imread("./images/test.jpg")
 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 # Find checkerboard corners
