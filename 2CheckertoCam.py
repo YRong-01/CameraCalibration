@@ -40,6 +40,12 @@ if ret:
         criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     )
 
+    # The first detected inner corner corresponds to objp[0] = (0, 0, 0).
+    origin = tuple(np.round(corners2[0, 0]).astype(int))
+    cv2.circle(img, origin, 10, (0, 0, 255), -1)
+    cv2.putText(img, "Origin (0,0,0)", (origin[0] + 15, origin[1]),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
     # Estimate extrinsic
     success, rvec, tvec = cv2.solvePnP(
         objp,
@@ -58,6 +64,12 @@ if ret:
 
     print("Translation vector:")
     print(tvec)
+
+    cv2.namedWindow("Checkerboard origin", cv2.WINDOW_NORMAL)
+    cv2.imshow("Checkerboard origin", img)
+    print("Press any key in the image window to close it.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 else:
     print("Checkerboard not found.")
